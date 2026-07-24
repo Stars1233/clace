@@ -58,6 +58,42 @@ type SourceFs struct {
 	mu          sync.RWMutex
 	nameToHash  map[string]string    // lookup (path to hash path)
 	hashToName  map[string][2]string // reverse lookup (hash path to path)
+
+	selfWritesMu sync.Mutex
+	selfWrites   map[string]time.Time // files written by the app itself (WritableSourceFs)
+}
+
+// selfWriteWindow is how long a self-written path keeps matching IsSelfWrite.
+// fsnotify delivers the echo events within milliseconds of the write; the
+// window just needs to comfortably cover scheduling delays.
+const selfWriteWindow = 2 * time.Second
+
+// recordSelfWrite marks name as written by the app itself, so the dev-mode
+// file watcher can tell the resulting fsnotify echo event apart from a user
+// edit (which must trigger a reload).
+func (f *SourceFs) recordSelfWrite(name string) {
+	f.selfWritesMu.Lock()
+	defer f.selfWritesMu.Unlock()
+	if f.selfWrites == nil {
+		f.selfWrites = make(map[string]time.Time)
+	}
+	f.selfWrites[path.Clean(name)] = time.Now()
+}
+
+// IsSelfWrite reports whether the app itself recently wrote name (slash
+// separated, relative to Root). Entries expire after selfWriteWindow, so a
+// later user edit of the same file is seen as a real change.
+func (f *SourceFs) IsSelfWrite(name string) bool {
+	f.selfWritesMu.Lock()
+	defer f.selfWritesMu.Unlock()
+	cutoff := time.Now().Add(-selfWriteWindow)
+	for p, writeTime := range f.selfWrites {
+		if writeTime.Before(cutoff) {
+			delete(f.selfWrites, p)
+		}
+	}
+	_, ok := f.selfWrites[path.Clean(name)]
+	return ok
 }
 
 var _ ReadableFS = (*SourceFs)(nil)
@@ -85,6 +121,8 @@ func (w *WritableSourceFs) Write(name string, bytes []byte) error {
 	if !ok {
 		return fmt.Errorf("cannot write to source fs (not writable mode)")
 	}
+	// Record before writing so the fsnotify event cannot arrive first
+	w.recordSelfWrite(name)
 	return wfs.Write(name, bytes)
 }
 
@@ -96,6 +134,7 @@ func (w *WritableSourceFs) Remove(name string) error {
 	if !ok {
 		return fmt.Errorf("cannot remove file from source fs (not writable mode)")
 	}
+	w.recordSelfWrite(name)
 	return wfs.Remove(name)
 }
 

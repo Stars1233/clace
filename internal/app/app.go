@@ -1063,10 +1063,10 @@ func (a *App) startWatcher() error {
 			}
 		}()
 
+		debounceDur := time.Duration(a.systemConfig.FileWatcherDebounceMillis) * time.Millisecond
 		inReload := atomic.Bool{}
-		reloadEndTime := atomic.Int64{}
-		inReload.Store(false)
-		reloadEndTime.Store(0)
+		pendingReload := atomic.Bool{}
+		var styleNotify *time.Timer // reset by each style.css event, only this goroutine touches it
 
 		for {
 			select {
@@ -1075,19 +1075,6 @@ func (a *App) startWatcher() error {
 					return
 				}
 
-				if inReload.Load() {
-					// If a reload is in progress, ignore the event
-					a.Trace().Str("event", fmt.Sprint(event)).Msg("Ignoring event since reload is in progress")
-					continue
-				}
-				endTime := reloadEndTime.Load()
-				diff := time.Now().UnixMilli() - endTime
-				a.Trace().Int64("diff", diff).Msg("Time since last reload")
-				if endTime > 0 && (time.Now().UnixMilli()-endTime) < int64(a.systemConfig.FileWatcherDebounceMillis)*5 {
-					// If a reload has happened recently, ignore the event
-					a.Trace().Str("event", fmt.Sprint(event)).Msg("Ignoring event since reload happened recently")
-					continue
-				}
 				if !(event.Has(fsnotify.Create) || event.Has(fsnotify.Write) || event.Has(fsnotify.Remove) || event.Has(fsnotify.Rename)) { //nolint:staticcheck
 					// ignore chmod events
 					a.Trace().Str("event", fmt.Sprint(event)).Msg("Ignoring event")
@@ -1107,30 +1094,75 @@ func (a *App) startWatcher() error {
 					continue
 				}
 
+				relName := event.Name
+				if rel, err := filepath.Rel(a.SourceUrl, event.Name); err == nil {
+					relName = filepath.ToSlash(rel)
+				}
+				if relName == dev.STYLE_FILE_PATH {
+					// The tailwind watcher (an external process) rewrites the
+					// output css whenever its inputs change - including the
+					// input.css every reload regenerates, so reloading on these
+					// events would loop forever. The new css is served on the
+					// next fetch without a reload; just refresh the clients,
+					// debounced since one rebuild can emit several writes.
+					if styleNotify == nil {
+						styleNotify = time.AfterFunc(debounceDur, a.notifyClients)
+					} else {
+						styleNotify.Reset(debounceDur)
+					}
+					continue
+				}
+				if a.sourceFS.IsSelfWrite(relName) {
+					// Written by the app itself during a reload (generated html,
+					// config lock, js libs): an echo, not a user edit
+					a.Trace().Str("event", fmt.Sprint(event)).Msg("Ignoring event for self-written file")
+					continue
+				}
+
 				a.Trace().Str("event", fmt.Sprint(event)).Msg("Received event")
 
+				// Mark the change pending first, then try to claim the reload
+				// slot. If a reload is already running it drains pendingReload
+				// before releasing the slot, so a change arriving mid-reload
+				// triggers a follow-up reload instead of being dropped (it used
+				// to be silently lost, leaving the app stale)
+				pendingReload.Store(true)
 				if !inReload.CompareAndSwap(false, true) {
-					// A reload started after the check above, ignore the event
+					a.Trace().Str("event", fmt.Sprint(event)).Msg("Reload in progress, change queued")
 					continue
 				}
 				go func() {
 					defer func() {
 						if r := recover(); r != nil {
 							a.Error().Msgf("Recovered from panic in watcher: %s", r)
+							inReload.Store(false)
 						}
 					}()
 
-					defer inReload.Store(false)
-					_, err := a.Reload(context.Background(), true, false, types.DryRun(false), ReloadOptions{ReloadContainer: true, Verify: false})
-					a.reloadError.Store(&err)
-					if err != nil {
-						a.Error().Err(err).Msg("Error reloading app")
-						if a.IsDev {
-							a.notifyClients() // Force clients to refresh if reload failed
+					for {
+						for pendingReload.Load() {
+							// Let a burst of events (editor save-all) settle, then
+							// clear pending for everything the reload will pick up
+							time.Sleep(debounceDur)
+							pendingReload.Store(false)
+							_, err := a.Reload(context.Background(), true, true, types.DryRun(false), ReloadOptions{ReloadContainer: true, Verify: false})
+							a.reloadError.Store(&err)
+							if err != nil {
+								a.Error().Err(err).Msg("Error reloading app")
+								if a.IsDev {
+									a.notifyClients() // Force clients to refresh if reload failed
+								}
+							}
+							a.Trace().Msg("Reloaded app after file changes")
+						}
+						inReload.Store(false)
+						// A change that arrived between the drain above and the
+						// Store set pendingReload but lost the CAS on inReload;
+						// reclaim the slot for it or it would sit unprocessed
+						if !pendingReload.Load() || !inReload.CompareAndSwap(false, true) {
+							return
 						}
 					}
-					a.Trace().Msg("Reloaded app after file changes")
-					reloadEndTime.Store(time.Now().UnixMilli())
 				}()
 			case err, ok := <-a.watcher.Errors:
 				a.Error().Err(err).Msgf("Error in watcher error receiver")
